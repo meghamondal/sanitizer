@@ -1,5 +1,6 @@
 import re
 from html import unescape
+from html.parser import HTMLParser
 from urllib.parse import unquote, urlparse
 
 from fastapi import FastAPI
@@ -133,25 +134,16 @@ def decode_html_entity(match):
 
 def decode_once(value):
 
-    # --------------------------------------------------------
     # 1. Percent escapes
-    # --------------------------------------------------------
-
     decoded = unquote(value)
 
-    # --------------------------------------------------------
     # 2. HTML entities
-    # --------------------------------------------------------
-
     decoded = HTML_ENTITY.sub(
         decode_html_entity,
         decoded
     )
 
-    # --------------------------------------------------------
     # 3. Unicode escapes
-    # --------------------------------------------------------
-
     decoded = UNICODE_ESCAPE.sub(
         lambda m: chr(int(m.group(1), 16)),
         decoded
@@ -177,7 +169,7 @@ def extract_urls(channel, output):
     # --------------------------------------------------------
     # HTML CHANNEL
     #
-    # Only quoted src= and href= attributes.
+    # Values of quoted src= and href= attributes.
     # --------------------------------------------------------
 
     if channel == "html":
@@ -232,7 +224,7 @@ def extract_urls(channel, output):
             if not target:
                 continue
 
-            # Markdown angle-bracket URL:
+            # Markdown URL in angle brackets:
             # ](<https://example.com>)
             if target.startswith("<"):
 
@@ -243,7 +235,7 @@ def extract_urls(channel, output):
 
             else:
 
-                # URL is first token.
+                # URL is the first whitespace-delimited token.
                 target = target.split()[0]
 
             urls.append(target)
@@ -281,7 +273,7 @@ DANGEROUS_SCHEME = re.compile(
 def has_dangerous_scheme(channel, output):
 
     # --------------------------------------------------------
-    # Direct dangerous schemes anywhere in the text.
+    # Direct dangerous schemes anywhere in text.
     # --------------------------------------------------------
 
     if DANGEROUS_SCHEME.search(output):
@@ -289,7 +281,7 @@ def has_dangerous_scheme(channel, output):
 
 
     # --------------------------------------------------------
-    # Extracted URL schemes.
+    # Schemes of extracted URLs.
     # --------------------------------------------------------
 
     for value in extract_urls(channel, output):
@@ -320,7 +312,7 @@ def has_external_exfil(channel, output):
         value = value.strip()
 
         # ----------------------------------------------------
-        # Protocol-relative references count as absolute.
+        # Protocol-relative URL is absolute.
         # ----------------------------------------------------
 
         if value.startswith("//"):
@@ -335,7 +327,7 @@ def has_external_exfil(channel, output):
 
 
         # ----------------------------------------------------
-        # Relative URL = allowed.
+        # Relative references are allowed.
         # ----------------------------------------------------
 
         if not parsed.scheme:
@@ -343,7 +335,8 @@ def has_external_exfil(channel, output):
 
 
         # ----------------------------------------------------
-        # Dangerous schemes are handled separately.
+        # Non-http/https schemes are handled by
+        # DANGEROUS_SCHEME.
         # ----------------------------------------------------
 
         if parsed.scheme.lower() not in {
@@ -355,13 +348,6 @@ def has_external_exfil(channel, output):
 
         # ----------------------------------------------------
         # Compare hostname ONLY.
-        #
-        # This prevents:
-        #
-        # allowed.example.attacker.com
-        # allowed.example@attacker.com
-        #
-        # from passing.
         # ----------------------------------------------------
 
         hostname = parsed.hostname
@@ -376,6 +362,87 @@ def has_external_exfil(channel, output):
 
 
 # ============================================================
+# HTML STRUCTURE PARSER
+# ============================================================
+
+class HTMLSafetyParser(HTMLParser):
+
+    def __init__(self):
+
+        super().__init__(
+            convert_charrefs=False
+        )
+
+        self.script_tag = False
+        self.event_handler = False
+
+
+    def handle_starttag(
+        self,
+        tag,
+        attrs
+    ):
+
+        tag = tag.lower()
+
+        # ----------------------------------------------------
+        # SCRIPT_TAG
+        # ----------------------------------------------------
+
+        if tag in {
+            "script",
+            "iframe",
+            "object",
+            "embed"
+        }:
+
+            self.script_tag = True
+            return
+
+
+        # ----------------------------------------------------
+        # EVENT_HANDLER
+        #
+        # Only actual HTML attributes beginning with "on"
+        # are treated as event handlers.
+        # ----------------------------------------------------
+
+        for name, value in attrs:
+
+            if name.lower().startswith("on"):
+
+                self.event_handler = True
+                return
+
+
+def html_structure_reason(output):
+
+    parser = HTMLSafetyParser()
+
+    try:
+
+        parser.feed(output)
+        parser.close()
+
+    except Exception:
+
+        # Parser errors do not create a new reason.
+        # Continue with the remaining deterministic checks.
+        pass
+
+
+    if parser.script_tag:
+        return "SCRIPT_TAG"
+
+
+    if parser.event_handler:
+        return "EVENT_HANDLER"
+
+
+    return None
+
+
+# ============================================================
 # HTML RULES
 # ============================================================
 
@@ -383,26 +450,15 @@ def html_reason(output):
 
     # --------------------------------------------------------
     # 1. SCRIPT_TAG
-    # --------------------------------------------------------
-
-    if re.search(
-        r"<\s*(?:script|iframe|object|embed)\b",
-        output,
-        re.IGNORECASE
-    ):
-        return "SCRIPT_TAG"
-
-
-    # --------------------------------------------------------
     # 2. EVENT_HANDLER
     # --------------------------------------------------------
 
-    if re.search(
-        r"\bon[a-zA-Z0-9_-]+\s*=",
-        output,
-        re.IGNORECASE
-    ):
-        return "EVENT_HANDLER"
+    structure_reason = html_structure_reason(
+        output
+    )
+
+    if structure_reason is not None:
+        return structure_reason
 
 
     # --------------------------------------------------------
@@ -543,11 +599,12 @@ def sql_reason(output):
 def shell_reason(output):
 
     # IMPORTANT:
-    # No SPACE in this string.
+    # There is NO SPACE in this string.
     #
     # Block exactly:
     # ; & | ` < >
     #
+
     if any(
         c in output
         for c in ";&|`<>"
@@ -560,7 +617,7 @@ def shell_reason(output):
         return "SHELL_METACHAR"
 
 
-    # Variable expansion form
+    # Shell variable expansion
     if "${" in output:
         return "SHELL_METACHAR"
 
@@ -596,7 +653,7 @@ def channel_reason(
 
 
 # ============================================================
-# ENDPOINT
+# MAIN ENDPOINT
 # ============================================================
 
 @app.post("/sanitize-output")
